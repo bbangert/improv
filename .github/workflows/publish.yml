@@ -1,30 +1,55 @@
 name: Publish
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
-env:
-  ELIXIR_VERSION: "1.20.2-otp-29"
-  OTP_VERSION: "29.0.3"
-  APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev libmnl-dev
+permissions:
+  contents: read
 
 jobs:
   publish:
-    name: Publish to hex.pm
+    name: Publish to Hex
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: actions/checkout@v4
+
+      # libmnl-dev: vintage_net (optional dep) compiles an if_monitor NIF
+      # during mix compile; libssl-dev for crypto-using NIFs.
+      - run: sudo apt-get update || true; sudo apt-get install -y build-essential pkg-config libssl-dev libmnl-dev
+
       - uses: erlef/setup-beam@v1
+        id: beam
         with:
-          elixir-version: ${{ env.ELIXIR_VERSION }}
-          otp-version: ${{ env.OTP_VERSION }}
-      - run: mix deps.get
-      # Publishing is gated on the suite passing on the tagged commit.
-      - run: MIX_ENV=test mix test --warnings-as-errors
-      # HEX_API_KEY must be a hex.pm key WITH PUBLISH SCOPE (a read-only key
-      # fails here with an authentication error).
-      - run: mix hex.publish --yes
+          otp-version: "29.0.3"
+          elixir-version: "1.20.2-otp-29"
+
+      # Guard against a release tag that doesn't match the package version —
+      # mix.exs is the source of truth for what actually gets shipped.
+      - name: Verify tag matches mix.exs version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          mix_version=$(grep -Po '@version\s+"\K[^"]+' mix.exs)
+          if [ "$tag" != "$mix_version" ]; then
+            echo "::error::Release tag $GITHUB_REF_NAME (${tag}) does not match mix.exs @version ${mix_version}"
+            exit 1
+          fi
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-test-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            mix-test-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-
+
+      - run: mix deps.get --check-locked
+      - run: mix compile --warnings-as-errors
+      - run: mix test
+
+      - name: Publish to Hex
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish --yes
