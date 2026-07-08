@@ -110,11 +110,29 @@ defmodule ImprovTest do
     end
 
     test "command_action routes decoded commands" do
-      assert Improv.command_action({:submit_wifi, "Net", "pw"}) == {:submit, "Net", "pw"}
-      assert Improv.command_action({:submit_wifi, "", "pw"}) == {:reject, :invalid_rpc}
+      assert Improv.command_action({:submit_wifi, "Net", "password"}) ==
+               {:submit, "Net", "password"}
+
+      assert Improv.command_action({:submit_wifi, "", "password"}) == {:reject, :invalid_rpc}
       assert Improv.command_action({:request_wifi_networks}) == :scan
+      assert Improv.command_action({:identify}) == :identify
+      assert Improv.command_action({:device_info}) == :device_info
       assert Improv.command_action({:error, :unknown_command}) == {:reject, :unknown_command}
       assert Improv.command_action({:error, :bad_checksum}) == {:reject, :invalid_rpc}
+    end
+
+    test "command_action enforces the WPA-PSK password length rule (empty or 8..63)" do
+      # Empty = open network, allowed.
+      assert Improv.command_action({:submit_wifi, "Net", ""}) == {:submit, "Net", ""}
+      # 7 bytes: too short for a WPA-PSK passphrase.
+      assert Improv.command_action({:submit_wifi, "Net", "1234567"}) == {:reject, :invalid_rpc}
+
+      for pwd <- ["12345678", String.duplicate("x", 63)] do
+        assert Improv.command_action({:submit_wifi, "Net", pwd}) == {:submit, "Net", pwd}
+      end
+
+      assert Improv.command_action({:submit_wifi, "Net", String.duplicate("x", 64)}) ==
+               {:reject, :invalid_rpc}
     end
   end
 
@@ -139,6 +157,21 @@ defmodule ImprovTest do
       assert_receive {:improv_status, %{state: :advertising}}
 
       assert %{state: :advertising} = Improv.status(mgr)
+    end
+
+    test "a raising connectivity probe stays disarmed (fail-closed) and survives" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          %{mgr: mgr} = start_manager(network_type: fn -> raise "probe boom" end)
+
+          # An erroring probe must read as online (do NOT arm) and must not
+          # crash the manager (it'd take the :one_for_all group with it).
+          refute_receive {:gatt, :register}, 150
+          assert %{state: :disarmed} = Improv.status(mgr)
+          assert Process.alive?(mgr)
+        end)
+
+      assert log =~ "connectivity probe raised"
     end
 
     test "stays disarmed when connectivity is present at boot" do
@@ -246,7 +279,7 @@ defmodule ImprovTest do
       %{mgr: mgr} = start_manager(network_type: offline())
       assert_receive {:gatt, :register}
 
-      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
 
       send(mgr, {VintageNet, ["interface", "wlan0", "connection"], :configuring, :internet, %{}})
@@ -261,7 +294,7 @@ defmodule ImprovTest do
       %{mgr: mgr} = start_manager(network_type: offline(), connect_timeout_ms: 10_000)
       assert_receive {:gatt, :register}
 
-      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
 
       # A non-wlan0 interface coming up must not be treated as Wi-Fi success.
@@ -285,10 +318,43 @@ defmodule ImprovTest do
       send(mgr, {:improv_rpc_command, frame})
 
       assert_receive :identified
-      # No RPC result and no error (per spec identify has no reply).
+      # No RPC result and no error (per spec identify has no reply). The second
+      # window is deliberately short: it only opens after the first 100 ms wait,
+      # so an error notify would already be in the mailbox by then.
       refute_receive {:gatt, {:notify, :rpc_result, _}}, 100
       refute_receive {:gatt, {:notify, :error_state, _}}, 10
       assert %{state: :advertising, error: nil} = Improv.status(mgr)
+    end
+
+    test "an identify burst coalesces to one run while the task is in flight" do
+      test = self()
+
+      %{mgr: mgr} =
+        start_manager(
+          network_type: offline(),
+          identify_fun: fn ->
+            send(test, :identified)
+            Process.sleep(150)
+          end
+        )
+
+      assert_receive {:gatt, :register}
+
+      frame = <<0x02, 0x00, Protocol.checksum(<<0x02, 0x00>>)>>
+      send(mgr, {:improv_rpc_command, frame})
+      send(mgr, {:improv_rpc_command, frame})
+      send(mgr, {:improv_rpc_command, frame})
+
+      assert_receive :identified
+      # Coalesced: no second run, and no error push either (identify has no
+      # result per spec, so silently ignoring is spec-compatible).
+      refute_receive :identified, 100
+      refute_receive {:gatt, {:notify, :error_state, _}}, 10
+
+      # Once the running task ends (its DOWN clears the ref), identify works again.
+      Process.sleep(100)
+      send(mgr, {:improv_rpc_command, frame})
+      assert_receive :identified, 500
     end
 
     test "identify without an identify_fun rejects as unknown command" do
@@ -344,7 +410,13 @@ defmodule ImprovTest do
       %{mgr: mgr} = start_manager(network_type: offline(), wifi: EchoWifi, ifname: "wlan1")
       assert_receive {:gatt, :register}
 
-      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      # Scan first (the session's first 0x04 — no debounce): ifname threads
+      # into the scan opts too.
+      scan_frame = <<0x04, 0x00, Protocol.checksum(<<0x04, 0x00>>)>>
+      send(mgr, {:improv_rpc_command, scan_frame})
+      assert_receive {:scan_opts, [ifname: "wlan1"]}
+
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
       assert_receive {:configure_opts, [ifname: "wlan1"]}
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
 
@@ -362,7 +434,7 @@ defmodule ImprovTest do
       %{mgr: mgr} = start_manager(network_type: offline(), connect_timeout_ms: 10_000)
       assert_receive {:gatt, :register}
 
-      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
 
       # :lan (associated, no internet) is not success — a bad password blips it.
@@ -387,11 +459,45 @@ defmodule ImprovTest do
       assert term == Protocol.encode_rpc_result(Protocol.request_networks_command(), [])
     end
 
+    test "a second scan inside the debounce window pushes nothing (no error either)" do
+      %{mgr: mgr} = start_manager(network_type: offline())
+      assert_receive {:gatt, :register}
+
+      frame = <<0x04, 0x00, Protocol.checksum(<<0x04, 0x00>>)>>
+      send(mgr, {:improv_rpc_command, frame})
+
+      # First scan streams: 2 networks + the empty terminator.
+      assert_receive {:gatt, {:notify, :rpc_result, _}}
+      assert_receive {:gatt, {:notify, :rpc_result, _}}
+      assert_receive {:gatt, {:notify, :rpc_result, _}}
+
+      # Inside the (default 5 s) window: ignored outright — the first scan's
+      # results already answered the client, so no error push.
+      send(mgr, {:improv_rpc_command, frame})
+      refute_receive {:gatt, {:notify, :rpc_result, _}}, 150
+      refute_receive {:gatt, {:notify, :error_state, _}}, 10
+    end
+
+    test "a scan after the debounce window works again" do
+      %{mgr: mgr} = start_manager(network_type: offline(), scan_debounce_ms: 100)
+      assert_receive {:gatt, :register}
+
+      frame = <<0x04, 0x00, Protocol.checksum(<<0x04, 0x00>>)>>
+      send(mgr, {:improv_rpc_command, frame})
+      assert_receive {:gatt, {:notify, :rpc_result, _}}
+      assert_receive {:gatt, {:notify, :rpc_result, _}}
+      assert_receive {:gatt, {:notify, :rpc_result, _}}
+
+      Process.sleep(120)
+      send(mgr, {:improv_rpc_command, frame})
+      assert_receive {:gatt, {:notify, :rpc_result, _}}
+    end
+
     test "a submit that never connects times out → unable-to-connect, reverts to AUTHORIZED" do
       %{mgr: mgr} = start_manager(network_type: offline(), connect_timeout_ms: 100)
       assert_receive {:gatt, :register}
 
-      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
       assert_receive {:advert, {:set_state, :provisioning}}
 
@@ -402,14 +508,31 @@ defmodule ImprovTest do
       assert %{state: :connected, error: :unable_to_connect} = Improv.status(mgr)
     end
 
+    test "a failed provision does NOT reset the idle timer" do
+      # Idle deadline armed at the submit: t0+300. The connect failure at
+      # t0+200 must NOT re-arm it (a failure is not a meaningful advance), so
+      # disarm still fires ~100 ms after the failure. If the failure reset the
+      # timer, disarm would land 300 ms after it — outside the assert window.
+      %{mgr: mgr} =
+        start_manager(network_type: offline(), timeout_ms: 300, connect_timeout_ms: 200)
+
+      assert_receive {:gatt, :register}
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
+      assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
+
+      assert_receive {:gatt, {:notify, :error_state, <<0x03>>}}, 1000
+      assert_receive {:gatt, :unregister}, 200
+      assert %{state: :disarmed} = Improv.status(mgr)
+    end
+
     test "a second submit while provisioning stays in provisioning (re-arms connect timer)" do
       %{mgr: mgr} = start_manager(network_type: offline(), connect_timeout_ms: 10_000)
       assert_receive {:gatt, :register}
 
-      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
 
-      send(mgr, {:improv_rpc_command, submit_frame("Other", "pw2")})
+      send(mgr, {:improv_rpc_command, submit_frame("Other", "password2")})
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
       assert %{state: :provisioning} = Improv.status(mgr)
     end
@@ -419,7 +542,7 @@ defmodule ImprovTest do
         start_manager(network_type: offline(), provisioned_hold_ms: 60)
 
       assert_receive {:gatt, :register}
-      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
 
       send(mgr, {VintageNet, ["interface", "wlan0", "connection"], :configuring, :internet, %{}})
@@ -434,7 +557,7 @@ defmodule ImprovTest do
       %{mgr: mgr} = start_manager(network_type: offline(), wifi: StubWifiNoIp)
       assert_receive {:gatt, :register}
 
-      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "pw")})
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
       assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
 
       send(mgr, {VintageNet, ["interface", "wlan0", "connection"], :configuring, :internet, %{}})
@@ -443,23 +566,34 @@ defmodule ImprovTest do
       assert %{state: :provisioned} = Improv.status(mgr)
     end
 
-    test "an unknown command notifies the error-state characteristic" do
+    test "an unknown opcode notifies the error-state characteristic" do
       %{mgr: mgr} = start_manager(network_type: offline())
       assert_receive {:gatt, :register}
 
-      # 0x02 = identify (unimplemented), valid checksum.
-      frame = <<0x02, 0x00, Protocol.checksum(<<0x02, 0x00>>)>>
+      # 0x08 is not an Improv command at all (checksum-valid frame).
+      frame = <<0x08, 0x00, Protocol.checksum(<<0x08, 0x00>>)>>
       send(mgr, {:improv_rpc_command, frame})
 
       assert_receive {:gatt, {:notify, :error_state, <<0x02>>}}
       assert %{error: :unknown_command} = Improv.status(mgr)
     end
 
+    test "RPC commands while disarmed are ignored entirely" do
+      # Defense-in-depth: the GATT app isn't even registered while disarmed,
+      # but a stray command must neither dispatch nor push an error.
+      %{mgr: mgr} = start_manager(network_type: online())
+      assert %{state: :disarmed} = Improv.status(mgr)
+
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
+      refute_receive {:gatt, {:notify, _, _}}, 100
+      assert %{state: :disarmed} = Improv.status(mgr)
+    end
+
     test "an invalid submit (empty SSID) notifies invalid-RPC error" do
       %{mgr: mgr} = start_manager(network_type: offline())
       assert_receive {:gatt, :register}
 
-      send(mgr, {:improv_rpc_command, submit_frame("", "pw")})
+      send(mgr, {:improv_rpc_command, submit_frame("", "password")})
       assert_receive {:gatt, {:notify, :error_state, <<0x01>>}}
     end
   end

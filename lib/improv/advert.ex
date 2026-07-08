@@ -203,7 +203,7 @@ defmodule Improv.Advert do
 
   def handle_cast(:register, state) do
     # Optimistic registered?, healed back to false by {:register_result,
-    # {:error, _}} if it actually failed, so a later register/1 retries (W1).
+    # {:error, _}} if it actually failed, so a later register/1 retries.
     conn = state.conn
     name = state.local_name
     parent = self()
@@ -243,37 +243,19 @@ defmodule Improv.Advert do
 
   # ── registration (outbound, off-loop) ─────────────────────────────────────
 
-  defp run_task(%{task_sup: sup}, fun) do
-    # Fall back to a bare Task when the supervisor is absent (host tests) or
-    # refuses (e.g. max_restarts) so the {:register_result, _} heal still fires
-    # (W1f). The refused case is logged — a restart-throttled supervisor
-    # spawning unsupervised work is when crash visibility matters most.
-    case Process.whereis(sup) do
-      nil ->
-        Task.start(fun)
-        :ok
-
-      _pid ->
-        case Task.Supervisor.start_child(sup, fun) do
-          {:ok, _} ->
-            :ok
-
-          error ->
-            Logger.warning(
-              "Improv.Advert Task.Supervisor #{inspect(sup)} refused " <>
-                "(#{inspect(error)}); running unsupervised"
-            )
-
-            Task.start(fun)
-            :ok
-        end
-    end
-  end
+  # Run an outbound D-Bus task off the GenServer loop. The bare-Task fallback
+  # inside Improv.Tasks matters here: without it the {:register_result, _}
+  # heal would never arrive and registered? would stick at true.
+  defp run_task(%{task_sup: sup}, fun), do: Improv.Tasks.run(sup, fun, "Improv.Advert")
 
   defp do_register(conn, local_name) do
     # Friendly post-connect GAP name (char 0x2A00 reflects Adapter1.Alias; default
     # is "BlueZ <ver>"), and make the adapter non-pairable for the session so the
     # provisioner isn't nudged to bond (the chars are cleartext — no bond needed).
+    # Capture the current Alias first so a failed registration can restore it;
+    # best-effort — if the Get fails we restore to "" and BlueZ falls back to
+    # the system name (its own default).
+    prev_alias = get_adapter_alias(conn)
     set_adapter_prop(conn, "Alias", {"s", local_name})
     set_adapter_prop(conn, "Pairable", {"b", false})
     log_advertising_slots(conn)
@@ -297,10 +279,27 @@ defmodule Improv.Advert do
 
       {:error, reason} = err ->
         Logger.error("Improv.Advert: RegisterAdvertisement failed: #{inspect(reason)}")
-        # The advert never went up, so undo the Pairable=false we set above —
-        # otherwise the adapter is stuck non-pairable for the rest of the boot.
+        # The advert never went up, so undo the adapter props we set above —
+        # otherwise the adapter is stuck non-pairable, wearing our alias, for
+        # the rest of the boot.
         set_adapter_prop(conn, "Pairable", {"b", true})
+        set_adapter_prop(conn, "Alias", {"s", prev_alias || ""})
         err
+    end
+  end
+
+  # Current org.bluez.Adapter1.Alias, or nil if unreadable (best-effort).
+  defp get_adapter_alias(conn) do
+    case DBus.call(
+           conn,
+           DevicePath.adapter_path(),
+           @props_iface,
+           "Get",
+           "ss",
+           ["org.bluez.Adapter1", "Alias"]
+         ) do
+      {:ok, [{_sig, current}]} when is_binary(current) -> current
+      _ -> nil
     end
   end
 

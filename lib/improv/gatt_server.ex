@@ -274,7 +274,7 @@ defmodule Improv.GattServer do
     # GetManagedObjects call it makes back into THIS handler — so it must run
     # off the GenServer loop or it deadlocks. We mark registered? optimistically
     # so notifications flow immediately, and heal it back to false if the Task
-    # reports failure (W1) so a later register/1 can retry.
+    # reports failure so a later register/1 can retry.
     conn = state.conn
     parent = self()
     run_task(state, fn -> send(parent, {:register_result, do_register(conn)}) end)
@@ -308,7 +308,7 @@ defmodule Improv.GattServer do
     {:stop, {:dbus_connection_down, reason}, state}
   end
 
-  # W1: heal the optimistic registered? flag if RegisterApplication actually failed,
+  # Heal the optimistic registered? flag if RegisterApplication actually failed,
   # so a later register/1 retries instead of being skipped by the guard.
   def handle_info({:register_result, {:ok, _}}, state), do: {:noreply, state}
 
@@ -320,36 +320,10 @@ defmodule Improv.GattServer do
 
   # ── registration (outbound, off-loop) ─────────────────────────────────────
 
-  # Run an outbound D-Bus task off the GenServer loop, under the Improv
-  # Task.Supervisor when it's available (production) and a bare Task otherwise
-  # (host tests, where the supervisor isn't started).
-  defp run_task(%{task_sup: sup}, fun) do
-    # Fall back to a bare Task when the supervisor is absent (host tests) or
-    # refuses (e.g. max_restarts) — otherwise the {:register_result, _} heal
-    # would never arrive and registered? would stick at true (W1f). The
-    # refused case is logged — a restart-throttled supervisor spawning
-    # unsupervised work is when crash visibility matters most.
-    case Process.whereis(sup) do
-      nil ->
-        Task.start(fun)
-        :ok
-
-      _pid ->
-        case Task.Supervisor.start_child(sup, fun) do
-          {:ok, _} ->
-            :ok
-
-          error ->
-            Logger.warning(
-              "Improv.GattServer Task.Supervisor #{inspect(sup)} refused " <>
-                "(#{inspect(error)}); running unsupervised"
-            )
-
-            Task.start(fun)
-            :ok
-        end
-    end
-  end
+  # Run an outbound D-Bus task off the GenServer loop. The bare-Task fallback
+  # inside Improv.Tasks matters here: without it the {:register_result, _}
+  # heal would never arrive and registered? would stick at true.
+  defp run_task(%{task_sup: sup}, fun), do: Improv.Tasks.run(sup, fun, "Improv.GattServer")
 
   defp do_register(conn) do
     case DBus.call(
