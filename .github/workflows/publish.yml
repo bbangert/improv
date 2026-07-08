@@ -1,0 +1,30 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  ELIXIR_VERSION: "1.20.2-otp-29"
+  OTP_VERSION: "29.0.3"
+  APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev libmnl-dev
+
+jobs:
+  publish:
+    name: Publish to hex.pm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix deps.get
+      # Publishing is gated on the suite passing on the tagged commit.
+      - run: MIX_ENV=test mix test --warnings-as-errors
+      # HEX_API_KEY must be a hex.pm key WITH PUBLISH SCOPE (a read-only key
+      # fails here with an authentication error).
+      - run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
