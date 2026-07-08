@@ -1,0 +1,8 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/priv/plts/
+erl_crash.dump
+*.ez
+improv-*.tar

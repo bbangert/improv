@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ELIXIR_VERSION: "1.20.2-otp-29"
+  OTP_VERSION: "29.0.3"
+  # libmnl-dev: vintage_net (optional dep) NIF; libssl-dev: crypto NIFs.
+  APT_PACKAGES: build-essential automake autoconf pkg-config libssl-dev libmnl-dev
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build/test
+          key: ${{ runner.os }}-test-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-test-
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix test --warnings-as-errors
+
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - run: mix format --check-formatted
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update || true; sudo apt-get install -y ${{ env.APT_PACKAGES }}
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build/dev
+            priv/plts
+          key: ${{ runner.os }}-dialyzer-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-dialyzer-
+      - run: mix deps.get
+      - run: mix dialyzer
