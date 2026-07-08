@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.1
+
+Hardening release addressing the post-extraction security review.
+
+- Submitted passwords are pre-validated in `Improv.command_action/1`
+  (empty for open networks, or the WPA-PSK 8..63-byte rule) and rejected
+  as `invalid_rpc` before reaching the Wi-Fi backend.
+- Exception logs on the credential path are bounded
+  (`printable_limit: 200`) so a raising Wi-Fi backend can't leak a
+  submitted PSK into persisted logs.
+- A raising `network_type:` connectivity probe now reads as online — the
+  device stays disarmed (fail-closed) instead of crashing the
+  `:one_for_all` group.
+- Identify commands coalesce while one identify task is running (also
+  serializing its physical side effects); scan commands are debounced
+  (`scan_debounce_ms:`, default 5 s).
+- A failed provision attempt no longer resets the session idle timer
+  (failures are not meaningful advances).
+- The adapter `Alias` is restored alongside `Pairable` when
+  `RegisterAdvertisement` fails.
+- RPC commands are ignored outside live-session states
+  (defense-in-depth).
+- CI/publish workflows pin GitHub Actions to commit SHAs.
+
 ## v0.1.0
 
 Initial release, extracted from the Universal Proxy Nerves application

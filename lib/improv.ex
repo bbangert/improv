@@ -57,6 +57,10 @@ defmodule Improv do
   # Bound on how long we wait for the Wi-Fi interface to join after a submit
   # before declaring the credentials bad and reverting to AUTHORIZED for a retry.
   @connect_timeout_ms 30_000
+  # Ignore a request-networks command arriving within this window of the last
+  # accepted one: the first scan's per-network results are still streaming to
+  # the client, so a flood of 0x04s would only multiply that traffic.
+  @scan_debounce_ms 5_000
   # Grace period before arming on a seemingly-offline boot: the boot connectivity
   # read races interface bring-up (DHCP/link), so an Ethernet device looks offline
   # for the first few seconds. Re-check after this delay and arm only if STILL
@@ -104,17 +108,34 @@ defmodule Improv do
   def valid_ssid?(_), do: false
 
   @doc """
+  Password pre-validation: empty (open network) or the WPA-PSK passphrase rule,
+  8..63 bytes. Rejecting garbage here keeps it from ever reaching
+  `VintageNet.configure` (which would raise inside the wifi seam). Pure.
+  """
+  @spec valid_password?(binary()) :: boolean()
+  def valid_password?(pwd) when is_binary(pwd) do
+    byte_size(pwd) == 0 or byte_size(pwd) in 8..63
+  end
+
+  def valid_password?(_), do: false
+
+  @doc """
   Map a decoded command (or decode error) to the manager action. Pure — the
   GenServer executes the returned action. Returns:
 
-    * `{:submit, ssid, pwd}` for a valid submit,
+    * `{:submit, ssid, pwd}` for a valid submit (SSID 1..32 bytes, password
+      empty or 8..63 bytes),
     * `:scan` for request-networks,
     * `{:reject, error_atom}` for an invalid submit / decode failure.
   """
   @spec command_action(Protocol.command() | Protocol.decode_error()) ::
           {:submit, binary(), binary()} | :scan | :identify | :device_info | {:reject, atom()}
   def command_action({:submit_wifi, ssid, pwd}) do
-    if valid_ssid?(ssid), do: {:submit, ssid, pwd}, else: {:reject, :invalid_rpc}
+    if valid_ssid?(ssid) and valid_password?(pwd) do
+      {:submit, ssid, pwd}
+    else
+      {:reject, :invalid_rpc}
+    end
   end
 
   def command_action({:request_wifi_networks}), do: :scan
@@ -156,6 +177,7 @@ defmodule Improv do
       connect_timeout_ms: Keyword.get(opts, :connect_timeout_ms, @connect_timeout_ms),
       boot_grace_ms: Keyword.get(opts, :boot_grace_ms, @boot_grace_ms),
       provisioned_hold_ms: Keyword.get(opts, :provisioned_hold_ms, @provisioned_hold_ms),
+      scan_debounce_ms: Keyword.get(opts, :scan_debounce_ms, @scan_debounce_ms),
       subscribe?: Keyword.get(opts, :subscribe?, true),
       fsm: :disarmed,
       error: nil,
@@ -163,7 +185,12 @@ defmodule Improv do
       arm_allowed?: true,
       timer: nil,
       provision_timer: nil,
-      cap_timer: nil
+      cap_timer: nil,
+      # Monitor ref of the running identify task — identifies coalesce while
+      # one is in flight (also serializes the LED park/restore side effects).
+      identify_ref: nil,
+      # Monotonic ms of the last accepted scan, for the 0x04 debounce.
+      last_scan_at: nil
     }
 
     {:ok, state, {:continue, :evaluate_boot}}
@@ -202,8 +229,17 @@ defmodule Improv do
     end
   end
 
-  def handle_info({:improv_rpc_command, bytes}, state) do
+  # Defense-in-depth: only dispatch RPCs in the states where a session is
+  # live. Unreachable via BLE today (the GATT app is only registered while
+  # armed), but a stray/late message must not drive a disarmed manager.
+  def handle_info({:improv_rpc_command, bytes}, %{fsm: fsm} = state)
+      when fsm in [:advertising, :connected, :provisioning] do
     {:noreply, dispatch_command(bytes, state)}
+  end
+
+  def handle_info({:improv_rpc_command, _bytes}, state) do
+    Logger.debug("Improv: ignoring RPC command while #{state.fsm}")
+    {:noreply, state}
   end
 
   # First genuine client connect advances :advertising → :connected and resets
@@ -256,12 +292,21 @@ defmodule Improv do
 
   # wlan0 didn't join in time — bad credentials / out of range. Report the error
   # and revert to AUTHORIZED so the provisioner can retry within the session.
+  # NO idle-timer reset: a failure is not a meaningful state advance (timeout
+  # reset rule), so the deadline armed at the submit stands.
   def handle_info(:provisioning_failed, %{fsm: :provisioning} = state) do
     state = push_error(state, :unable_to_connect)
-    {:noreply, state |> Map.put(:provision_timer, nil) |> transition(:connected)}
+
+    {:noreply,
+     state |> Map.put(:provision_timer, nil) |> transition(:connected, reset_timer?: false)}
   end
 
   def handle_info(:provisioning_failed, state), do: {:noreply, state}
+
+  # The running identify task ended (normally or not) — allow the next 0x02.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{identify_ref: ref} = state) do
+    {:noreply, %{state | identify_ref: nil}}
+  end
 
   def handle_info(_other, state), do: {:noreply, state}
 
@@ -282,9 +327,14 @@ defmodule Improv do
   # client never sends it — reject like an unknown command if one does anyway.
   defp run_identify(%{identify_fun: nil} = state), do: push_error(state, :unknown_command)
 
+  # Coalesce: ignore 0x02 while an identify task is already running — no error
+  # push (the spec gives identify no result), and running one at a time also
+  # serializes the identify_fun's physical side effects (LED park/restore).
+  defp run_identify(%{identify_ref: ref} = state) when is_reference(ref), do: state
+
   defp run_identify(%{identify_fun: fun} = state) do
-    run_task(state, fun)
-    state
+    {:ok, pid} = run_task(state, fun)
+    %{state | identify_ref: Process.monitor(pid)}
   end
 
   defp send_device_info(%{device_info: nil} = state), do: push_error(state, :unknown_command)
@@ -336,7 +386,20 @@ defmodule Improv do
     %{state | provision_timer: nil}
   end
 
+  # Debounce: ignore a scan arriving inside the window of the last accepted
+  # one — the client's outstanding scan is still streaming its results, so
+  # push no error either. Monotonic clock (never steps, unlike wall time).
   defp request_networks(state) do
+    now = System.monotonic_time(:millisecond)
+
+    if state.last_scan_at != nil and now - state.last_scan_at < state.scan_debounce_ms do
+      state
+    else
+      do_request_networks(%{state | last_scan_at: now})
+    end
+  end
+
+  defp do_request_networks(state) do
     %{gatt: gatt, wifi: wifi} = state
     wifi_opts = wifi_opts(state)
 
@@ -401,15 +464,16 @@ defmodule Improv do
   end
 
   # Advance the FSM, push the current-state notification + advert update, reset
-  # the idle timer (only state advances call this), and broadcast.
-  defp transition(state, new_fsm) do
+  # the idle timer (only *meaningful* advances reset it — the provisioning
+  # failure revert passes `reset_timer?: false`), and broadcast.
+  defp transition(state, new_fsm, opts \\ []) do
     cs = current_state_atom(new_fsm)
     notify_state(state, cs)
     Advert.set_state(state.advert, cs)
 
-    %{state | fsm: new_fsm}
-    |> reset_timer()
-    |> broadcast()
+    state = %{state | fsm: new_fsm}
+    state = if Keyword.get(opts, :reset_timer?, true), do: reset_timer(state), else: state
+    broadcast(state)
   end
 
   defp mark_provisioned(state) do
@@ -450,11 +514,15 @@ defmodule Improv do
 
   # Call the Wi-Fi module through a variable, rescued so a raising impl can't
   # crash the manager (or the scan Task). Used from both the loop and the Task.
+  # printable_limit bounds the log: the rescued call can carry the submitted
+  # PSK in exception args (e.g. a raising configure), and credentials must not
+  # land in the (RingLogger-persisted) log.
   defp safe_apply(mod, fun, args) do
     apply(mod, fun, args)
   rescue
     e ->
-      Logger.warning("Improv: wifi #{fun} failed: #{inspect(e, limit: 5)}")
+      Logger.warning("Improv: wifi #{fun} failed: #{inspect(e, limit: 5, printable_limit: 200)}")
+
       {:error, :wifi_unavailable}
   end
 
@@ -500,40 +568,27 @@ defmodule Improv do
 
   # ── tasks ──────────────────────────────────────────────────────────────────
 
-  # Run off the GenServer loop, under the Improv Task.Supervisor when it's alive
-  # (production), else a bare Task (host tests). Falls back to Task.start if the
-  # supervisor refuses (e.g. max_restarts) so work is never silently dropped —
-  # but that production case is logged: a restart-throttled supervisor spawning
-  # unsupervised work is exactly when crash visibility matters most. No log when
-  # the supervisor simply isn't registered (host tests).
-  defp run_task(%{task_sup: sup}, fun) do
-    case Process.whereis(sup) do
-      nil ->
-        Task.start(fun)
-        :ok
-
-      _pid ->
-        case Task.Supervisor.start_child(sup, fun) do
-          {:ok, _} ->
-            :ok
-
-          error ->
-            Logger.warning(
-              "Improv Task.Supervisor #{inspect(sup)} refused (#{inspect(error)}); " <>
-                "running unsupervised"
-            )
-
-            Task.start(fun)
-            :ok
-        end
-    end
-  end
+  defp run_task(%{task_sup: sup}, fun), do: Improv.Tasks.run(sup, fun, "Improv")
 
   # ── connectivity ─────────────────────────────────────────────────────────
 
   # No probe configured → treated as online → never arms (see init/1).
   defp online?(%{network_type: nil}), do: true
-  defp online?(state), do: state.network_type.() != :disconnected
+
+  # A raising probe reads as online, i.e. the device STAYS DISARMED
+  # (fail-closed: an error must not open the provisioning surface), and the
+  # crash can't take the :one_for_all group down with it.
+  defp online?(state) do
+    state.network_type.() != :disconnected
+  rescue
+    e ->
+      Logger.warning(
+        "Improv: connectivity probe raised (staying disarmed): " <>
+          inspect(e, limit: 5, printable_limit: 200)
+      )
+
+      true
+  end
 
   # Best-effort: only cast when the scanner is actually running (no-op off-target
   # / in host tests). suspend_scan/resume_scan are themselves casts.

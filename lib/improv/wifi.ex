@@ -57,8 +57,11 @@ defmodule Improv.Wifi do
 
     {:ok, networks}
   rescue
+    # printable_limit bounds the log — exception args on this path can carry
+    # peer-influenced data, and the same bound keeps any credential-bearing
+    # exception (see the manager's safe_apply/3) out of persisted logs.
     e ->
-      Logger.warning("Improv.Wifi: scan failed: #{inspect(e, limit: 5)}")
+      Logger.warning("Improv.Wifi: scan failed: #{inspect(e, limit: 5, printable_limit: 200)}")
       {:error, :scan_failed}
   end
 
