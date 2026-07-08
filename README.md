@@ -12,6 +12,25 @@ Implements the full Improv BLE protocol: submit Wi-Fi (`0x01`), identify
 (`0x02`), device info (`0x03`), and scan networks (`0x04`), with the
 capabilities byte derived from what you configure.
 
+## Documentation
+
+Start here once you're ready to go beyond the quickstart below:
+
+- [Architecture guide](guides/architecture.md) — the supervision tree
+  (why the group is `:one_for_all` and mounted last), the manager state
+  machine, and the exported D-Bus surface.
+- [Host integration guide](guides/host_integration.md) — the integration
+  cookbook: every `Improv.Supervisor` option, the status/PubSub contract,
+  the built-in Wi-Fi backend and how to replace it, and the
+  vintage_net-is-optional story.
+- [Protocol and security guide](guides/protocol.md) — the wire formats,
+  the 31-byte legacy-advertising budget math, and the session security
+  model that stands in for the Improv authorization handshake.
+
+The core modules carry the reference detail: `Improv` (manager + every
+option), `Improv.Protocol` (the codec), `Improv.GattServer` /
+`Improv.Advert` (the exporters), `Improv.Wifi` (the backend).
+
 ## Requirements
 
 - BlueZ ≥ 5.x with `bluetoothd` running on the system D-Bus (the usual
