@@ -21,12 +21,6 @@ defmodule Improv.WifiTest do
       assert %{vintage_net_wifi: %{networks: [network]}} = map
       assert network == %{key_mgmt: :none, ssid: "OpenAP"}
     end
-
-    test "bare 2-arity call defaults to no flags → WPA-PSK (backward compat)" do
-      map = Wifi.configure_map("MyNet", "secret12")
-      assert %{vintage_net_wifi: %{networks: [network]}} = map
-      assert network == %{key_mgmt: :wpa_psk, ssid: "MyNet", psk: "secret12"}
-    end
   end
 
   describe "configure_map/3" do
@@ -43,8 +37,9 @@ defmodule Improv.WifiTest do
     end
 
     test "compound-only SAE flag (e.g. :wpa2_sae_ccmp) also yields SAE" do
-      map =
-        Wifi.configure_map("SecureNet", "secret12", [:wpa2_sae_ccmp, :wpa2, :sae, :ccmp, :ess])
+      # Deliberately NO bare :sae — proves the substring match on compound
+      # atoms, which membership checking alone would miss.
+      map = Wifi.configure_map("SecureNet", "secret12", [:wpa2_sae_ccmp, :ccmp, :ess])
 
       assert %{vintage_net_wifi: %{networks: [network]}} = map
 

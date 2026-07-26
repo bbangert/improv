@@ -80,7 +80,10 @@ defmodule Improv.Wifi do
   pick `key_mgmt: :sae` vs `:wpa_psk` — see `configure_map/3`. The lookup is
   best-effort: a raise, a nil property, or the SSID simply not appearing in
   scan results all fall back to `[]` (the PSK path) rather than failing the
-  call. `:vintage_get` (the lookup) and `:configure_fn` (2-arity
+  call. The flags come from the same live property `scan_networks/1` reads,
+  so the usual scan-then-submit provisioning flow keeps them fresh; a submit
+  with no recent scan can miss a just-appeared SAE-only network and fall
+  back to PSK. `:vintage_get` (the lookup) and `:configure_fn` (2-arity
   `(ifname, config) -> term`) are injectable for tests.
   """
   @spec configure(binary(), binary(), keyword()) :: term()
@@ -98,7 +101,8 @@ defmodule Improv.Wifi do
   # access_points property. If ANY BSS mentions psk, that ends up in the
   # union too, so `sae_only?/1` comes back false and we keep the
   # broad-compatibility PSK path — deliberate for multi-band APs / transition
-  # mode. Any raise (bad get, malformed property) falls back to `[]`.
+  # mode. Any raise (bad get, malformed property) falls back to `[]` — logged,
+  # since a silent failure here reverts SAE-only networks to the PSK bug.
   defp ssid_flags(ifname, ssid, get) do
     ["interface", ifname, "wifi", "access_points"]
     |> get.()
@@ -107,7 +111,14 @@ defmodule Improv.Wifi do
     |> Enum.flat_map(&Map.get(&1, :flags, []))
     |> Enum.uniq()
   rescue
-    _ -> []
+    # Same printable_limit bound as scan_networks/1: the exception can carry
+    # peer-influenced data (the submitted SSID); no password is in scope here.
+    e ->
+      Logger.warning(
+        "Improv.Wifi: flags lookup failed, assuming PSK: #{inspect(e, limit: 5, printable_limit: 200)}"
+      )
+
+      []
   end
 
   @doc """
