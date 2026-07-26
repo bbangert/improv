@@ -14,6 +14,11 @@ defmodule Improv.Wifi do
   `wpa_supplicant`) rather than `VintageNetWiFi.quick_scan/1`, whose fresh-scan +
   2 s sleep read an empty list mid-scan on hardware. It also kicks an async
   `VintageNet.scan/1` to refresh the property for the next call.
+
+  Improv only carries SSID+password, not a security type, so `configure/3`
+  infers `key_mgmt: :sae` (WPA3) vs `:wpa_psk` from the target SSID's scan
+  flags — PSK is the fallback whenever the SSID isn't in scan results (hidden
+  network, aged out) or the lookup itself fails.
   """
 
   require Logger
@@ -70,14 +75,39 @@ defmodule Improv.Wifi do
   defp ap_list(_), do: []
 
   @doc """
-  Apply submitted credentials to the Wi-Fi interface. `:configure_fn` (2-arity
-  `(ifname, config) -> term`) is injectable for tests.
+  Apply submitted credentials to the Wi-Fi interface. Looks up the target
+  SSID's live scan flags (union across every BSSID advertising that SSID) to
+  pick `key_mgmt: :sae` vs `:wpa_psk` — see `configure_map/3`. The lookup is
+  best-effort: a raise, a nil property, or the SSID simply not appearing in
+  scan results all fall back to `[]` (the PSK path) rather than failing the
+  call. `:vintage_get` (the lookup) and `:configure_fn` (2-arity
+  `(ifname, config) -> term`) are injectable for tests.
   """
   @spec configure(binary(), binary(), keyword()) :: term()
   def configure(ssid, password, opts \\ []) do
     ifname = Keyword.get(opts, :ifname, @default_ifname)
+    get = Keyword.get(opts, :vintage_get, &vintage_get/1)
     cfg = Keyword.get(opts, :configure_fn, &default_configure/2)
-    cfg.(ifname, configure_map(ssid, password))
+
+    flags = ssid_flags(ifname, ssid, get)
+
+    cfg.(ifname, configure_map(ssid, password, flags))
+  end
+
+  # Union of `:flags` across every AP (BSSID) advertising `ssid` in the live
+  # access_points property. If ANY BSS mentions psk, that ends up in the
+  # union too, so `sae_only?/1` comes back false and we keep the
+  # broad-compatibility PSK path — deliberate for multi-band APs / transition
+  # mode. Any raise (bad get, malformed property) falls back to `[]`.
+  defp ssid_flags(ifname, ssid, get) do
+    ["interface", ifname, "wifi", "access_points"]
+    |> get.()
+    |> ap_list()
+    |> Enum.filter(&(Map.get(&1, :ssid) == ssid))
+    |> Enum.flat_map(&Map.get(&1, :flags, []))
+    |> Enum.uniq()
+  rescue
+    _ -> []
   end
 
   @doc """
@@ -99,16 +129,27 @@ defmodule Improv.Wifi do
   # ── pure shaping (host-tested) ─────────────────────────────────────────────
 
   @doc """
-  VintageNet config map for a submitted SSID/password. An empty password yields
-  an open (`key_mgmt: :none`) network; otherwise WPA-PSK. Pure.
+  VintageNet config map for a submitted SSID/password. An empty password
+  yields an open (`key_mgmt: :none`) network; otherwise `key_mgmt: :sae`
+  (WPA3, with mandatory PMF — `ieee80211w: 2`) if `flags` say the SSID is
+  SAE-only, else the broad-compatibility `:wpa_psk` fallback (also used for
+  hidden networks, SSIDs that aged out of scan results, and WPA2/WPA3
+  transition-mode networks, which still accept PSK). `flags` is threaded in
+  by the caller (`configure/3`, from a live scan) — this function itself
+  stays pure and does no lookups.
   """
-  @spec configure_map(binary(), binary()) :: map()
-  def configure_map(ssid, password) do
+  @spec configure_map(binary(), binary(), [atom()]) :: map()
+  def configure_map(ssid, password, flags \\ []) do
     network =
-      if password == "" do
-        %{key_mgmt: :none, ssid: ssid}
-      else
-        %{key_mgmt: :wpa_psk, ssid: ssid, psk: password}
+      cond do
+        password == "" ->
+          %{key_mgmt: :none, ssid: ssid}
+
+        sae_only?(flags) ->
+          %{key_mgmt: :sae, ssid: ssid, sae_password: password, ieee80211w: 2}
+
+        true ->
+          %{key_mgmt: :wpa_psk, ssid: ssid, psk: password}
       end
 
     %{
@@ -134,6 +175,24 @@ defmodule Improv.Wifi do
 
   defp wpa_old_flag?(f) when is_atom(f), do: f |> Atom.to_string() |> String.starts_with?("wpa")
   defp wpa_old_flag?(_), do: false
+
+  # SAE-only (WPA3-only): at least one flag mentions "sae" and none mention
+  # "psk". Substring match (not membership) so this covers both decomposed
+  # flags (`:sae`, `:psk`) and compound ones (`:wpa2_sae_ccmp`,
+  # `:wpa2_psk_sae_ccmp`) the same way `wpa_old_flag?/1` prefix-matches
+  # old-style `wpa_*` flags. A network in transition mode mentions both, so
+  # it falls through to the PSK path — deliberately, for broad compatibility.
+  defp sae_only?(flags) when is_list(flags) do
+    Enum.any?(flags, &flag_mentions?(&1, "sae")) and
+      not Enum.any?(flags, &flag_mentions?(&1, "psk"))
+  end
+
+  defp sae_only?(_), do: false
+
+  defp flag_mentions?(flag, keyword) when is_atom(flag),
+    do: flag |> Atom.to_string() |> String.contains?(keyword)
+
+  defp flag_mentions?(_, _), do: false
 
   defp first_ipv4(addrs) when is_list(addrs) do
     Enum.find_value(addrs, fn

@@ -21,6 +21,66 @@ defmodule Improv.WifiTest do
       assert %{vintage_net_wifi: %{networks: [network]}} = map
       assert network == %{key_mgmt: :none, ssid: "OpenAP"}
     end
+
+    test "bare 2-arity call defaults to no flags → WPA-PSK (backward compat)" do
+      map = Wifi.configure_map("MyNet", "secret12")
+      assert %{vintage_net_wifi: %{networks: [network]}} = map
+      assert network == %{key_mgmt: :wpa_psk, ssid: "MyNet", psk: "secret12"}
+    end
+  end
+
+  describe "configure_map/3" do
+    test "SAE-only decomposed flags yield a WPA3/SAE network, no psk key" do
+      map = Wifi.configure_map("SecureNet", "secret12", [:wpa2, :sae, :ccmp, :ess])
+      assert %{vintage_net_wifi: %{networks: [network]}} = map
+
+      assert network == %{
+               key_mgmt: :sae,
+               ssid: "SecureNet",
+               sae_password: "secret12",
+               ieee80211w: 2
+             }
+    end
+
+    test "compound-only SAE flag (e.g. :wpa2_sae_ccmp) also yields SAE" do
+      map =
+        Wifi.configure_map("SecureNet", "secret12", [:wpa2_sae_ccmp, :wpa2, :sae, :ccmp, :ess])
+
+      assert %{vintage_net_wifi: %{networks: [network]}} = map
+
+      assert network == %{
+               key_mgmt: :sae,
+               ssid: "SecureNet",
+               sae_password: "secret12",
+               ieee80211w: 2
+             }
+    end
+
+    test "transition-mode flags (sae + psk both mentioned) stay on wpa_psk" do
+      flags = [:wpa2_psk_sae_ccmp, :wpa2, :psk, :sae, :ccmp, :ess]
+      map = Wifi.configure_map("TransitionNet", "secret12", flags)
+      assert %{vintage_net_wifi: %{networks: [network]}} = map
+      assert network == %{key_mgmt: :wpa_psk, ssid: "TransitionNet", psk: "secret12"}
+    end
+
+    test "psk-only flags yield wpa_psk" do
+      flags = [:wpa2_psk_ccmp, :wpa2, :psk, :ccmp, :ess]
+      map = Wifi.configure_map("Net1", "secret12", flags)
+      assert %{vintage_net_wifi: %{networks: [network]}} = map
+      assert network == %{key_mgmt: :wpa_psk, ssid: "Net1", psk: "secret12"}
+    end
+
+    test "empty flags list yields wpa_psk" do
+      map = Wifi.configure_map("Net1", "secret12", [])
+      assert %{vintage_net_wifi: %{networks: [network]}} = map
+      assert network == %{key_mgmt: :wpa_psk, ssid: "Net1", psk: "secret12"}
+    end
+
+    test "empty password wins regardless of flags — open network even for SAE-only" do
+      map = Wifi.configure_map("SecureNet", "", [:wpa2, :sae, :ccmp, :ess])
+      assert %{vintage_net_wifi: %{networks: [network]}} = map
+      assert network == %{key_mgmt: :none, ssid: "SecureNet"}
+    end
   end
 
   describe "secured?/1" do
@@ -108,6 +168,85 @@ defmodule Improv.WifiTest do
       Wifi.configure("MyNet", "pw", configure_fn: cfg, ifname: "wlan1")
 
       assert_receive {:configured, "wlan1", _config}
+    end
+
+    test "SSID whose only scanned APs are SAE-only reaches configure_fn as SAE" do
+      test = self()
+      cfg = fn ifname, config -> send(test, {:configured, ifname, config}) end
+
+      aps = %{
+        "aa" => %{ssid: "SecureNet", signal_dbm: -50, flags: [:wpa2, :sae, :ccmp, :ess]}
+      }
+
+      get = fn ["interface", "wlan0", "wifi", "access_points"] -> aps end
+
+      Wifi.configure("SecureNet", "secret12", configure_fn: cfg, vintage_get: get)
+
+      assert_receive {:configured, "wlan0", %{vintage_net_wifi: %{networks: [net]}}}
+
+      assert net == %{
+               key_mgmt: :sae,
+               ssid: "SecureNet",
+               sae_password: "secret12",
+               ieee80211w: 2
+             }
+    end
+
+    test "SSID absent from scan results falls back to wpa_psk" do
+      test = self()
+      cfg = fn ifname, config -> send(test, {:configured, ifname, config}) end
+
+      aps = %{
+        "aa" => %{ssid: "SomeOtherNet", signal_dbm: -50, flags: [:wpa2, :sae, :ccmp, :ess]}
+      }
+
+      get = fn ["interface", "wlan0", "wifi", "access_points"] -> aps end
+
+      Wifi.configure("SecureNet", "secret12", configure_fn: cfg, vintage_get: get)
+
+      assert_receive {:configured, "wlan0", %{vintage_net_wifi: %{networks: [net]}}}
+      assert net == %{key_mgmt: :wpa_psk, ssid: "SecureNet", psk: "secret12"}
+    end
+
+    test "same SSID on two BSSIDs, one psk-mentioning — union wins, wpa_psk used" do
+      test = self()
+      cfg = fn ifname, config -> send(test, {:configured, ifname, config}) end
+
+      aps = %{
+        # SAE-only on this band...
+        "aa" => %{ssid: "SecureNet", signal_dbm: -50, flags: [:wpa2, :sae, :ccmp, :ess]},
+        # ...but transition-mode (also mentions psk) on the other band.
+        "bb" => %{ssid: "SecureNet", signal_dbm: -60, flags: [:wpa2, :psk, :sae, :ccmp, :ess]}
+      }
+
+      get = fn ["interface", "wlan0", "wifi", "access_points"] -> aps end
+
+      Wifi.configure("SecureNet", "secret12", configure_fn: cfg, vintage_get: get)
+
+      assert_receive {:configured, "wlan0", %{vintage_net_wifi: %{networks: [net]}}}
+      assert net == %{key_mgmt: :wpa_psk, ssid: "SecureNet", psk: "secret12"}
+    end
+
+    test "a raising vintage_get still calls configure_fn, falling back to wpa_psk" do
+      test = self()
+      cfg = fn ifname, config -> send(test, {:configured, ifname, config}) end
+      get = fn _ -> raise "boom" end
+
+      Wifi.configure("SecureNet", "secret12", configure_fn: cfg, vintage_get: get)
+
+      assert_receive {:configured, "wlan0", %{vintage_net_wifi: %{networks: [net]}}}
+      assert net == %{key_mgmt: :wpa_psk, ssid: "SecureNet", psk: "secret12"}
+    end
+
+    test "a vintage_get returning nil falls back to wpa_psk" do
+      test = self()
+      cfg = fn ifname, config -> send(test, {:configured, ifname, config}) end
+      get = fn _ -> nil end
+
+      Wifi.configure("SecureNet", "secret12", configure_fn: cfg, vintage_get: get)
+
+      assert_receive {:configured, "wlan0", %{vintage_net_wifi: %{networks: [net]}}}
+      assert net == %{key_mgmt: :wpa_psk, ssid: "SecureNet", psk: "secret12"}
     end
   end
 

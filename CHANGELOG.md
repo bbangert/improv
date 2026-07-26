@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `Improv.Wifi.configure/3` no longer hardcodes `key_mgmt: :wpa_psk` for
+  every non-empty password. SAE-only (WPA3-only) networks associated fine
+  but always failed the 4-way handshake, since PSK auth was offered against
+  an AP that only speaks SAE. `key_mgmt: :sae` (with `sae_password` and
+  `ieee80211w: 2`, PMF being mandatory for WPA3) is now inferred from the
+  target SSID's live scan flags, falling back to `:wpa_psk` when no scanned
+  BSS is SAE-only, the SSID isn't in scan results (hidden network, aged
+  out), or the scan lookup itself raises (#2).
+
 ## v0.1.1
 
 Hardening release addressing the post-extraction security review.
