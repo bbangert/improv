@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.2
 
 - `Improv.Wifi.configure/3` no longer hardcodes `key_mgmt: :wpa_psk` for
   every non-empty password. SAE-only (WPA3-only) networks associated fine
