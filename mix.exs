@@ -1,7 +1,7 @@
 defmodule Improv.MixProject do
   use Mix.Project
 
-  @version "0.1.2"
+  @version "0.1.3"
   @source_url "https://github.com/bbangert/improv"
 
   def project do
@@ -37,7 +37,7 @@ defmodule Improv.MixProject do
 
   defp deps do
     [
-      {:bluez, "~> 0.1"},
+      {:bluez, "~> 0.2"},
       {:phoenix_pubsub, "~> 2.1", optional: true},
       # runtime: false so the lib's own dev/test runs never START vintage_net
       # (it writes /etc/resolv.conf at startup — host-hostile). Guarded call
