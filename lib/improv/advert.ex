@@ -179,18 +179,23 @@ defmodule Improv.Advert do
   # instead of returning nil, and the hostname fallback must still win.
   defp mac_suffix do
     if Code.ensure_loaded?(VintageNet) do
-      Enum.find_value(["eth0", "wlan0"], fn iface ->
-        case apply(VintageNet, :get, [["interface", iface, "mac_address"]]) do
-          mac when is_binary(mac) and mac != "" ->
-            mac |> String.replace(":", "") |> String.slice(-4, 4)
-
-          _ ->
-            nil
-        end
-      end)
+      Enum.find_value(["eth0", "wlan0"], &iface_mac_suffix/1)
     end
   rescue
     _ -> nil
+  end
+
+  # Deliberate apply/3: vintage_net is optional, so a literal remote call would
+  # warn "VintageNet.get/1 is undefined" when compiled without it.
+  defp iface_mac_suffix(iface) do
+    # credo:disable-for-next-line Credo.Check.Refactor.Apply
+    case apply(VintageNet, :get, [["interface", iface, "mac_address"]]) do
+      mac when is_binary(mac) and mac != "" ->
+        mac |> String.replace(":", "") |> String.slice(-4, 4)
+
+      _ ->
+        nil
+    end
   end
 
   defp hostname_suffix do

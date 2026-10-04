@@ -1,9 +1,9 @@
 defmodule Improv.GattServerTest do
   use ExUnit.Case, async: true
 
+  alias Bluez.Rebus.Message
   alias Improv.GattServer
   alias Improv.Protocol
-  alias Bluez.Rebus.Message
 
   @service_iface "org.bluez.GattService1"
   @char_iface "org.bluez.GattCharacteristic1"

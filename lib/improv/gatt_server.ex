@@ -37,6 +37,7 @@ defmodule Improv.GattServer do
   @introspect_iface "org.freedesktop.DBus.Introspectable"
   @service_iface "org.bluez.GattService1"
   @char_iface "org.bluez.GattCharacteristic1"
+  @char_methods ~w(ReadValue WriteValue StartNotify StopNotify)
   @gatt_mgr_iface "org.bluez.GattManager1"
 
   @app_root "/org/improv"
@@ -386,18 +387,8 @@ defmodule Improv.GattServer do
         reply_error(conn, msg, "org.freedesktop.DBus.Error.PropertyReadOnly", "read-only")
         state
 
-      {@char_iface, "ReadValue"} ->
-        reply_read_value(conn, msg, hf, state)
-        state
-
-      {@char_iface, "WriteValue"} ->
-        handle_write_value(msg, hf, state)
-
-      {@char_iface, "StartNotify"} ->
-        handle_start_notify(msg, hf, state)
-
-      {@char_iface, "StopNotify"} ->
-        handle_stop_notify(msg, hf, state)
+      {@char_iface, member} when member in @char_methods ->
+        dispatch_char_call(member, msg, hf, state)
 
       {@introspect_iface, "Introspect"} ->
         reply(conn, msg, [introspect_xml(hf[:path])], "s")
@@ -420,6 +411,15 @@ defmodule Improv.GattServer do
       reply_error(state.conn, msg, "org.freedesktop.DBus.Error.Failed", "internal error")
       state
   end
+
+  defp dispatch_char_call("ReadValue", msg, hf, state) do
+    reply_read_value(state.conn, msg, hf, state)
+    state
+  end
+
+  defp dispatch_char_call("WriteValue", msg, hf, state), do: handle_write_value(msg, hf, state)
+  defp dispatch_char_call("StartNotify", msg, hf, state), do: handle_start_notify(msg, hf, state)
+  defp dispatch_char_call("StopNotify", msg, hf, state), do: handle_stop_notify(msg, hf, state)
 
   defp reply_get_all(conn, msg, hf, state) do
     case props_for(hf[:path], state.values, state.notifying) do

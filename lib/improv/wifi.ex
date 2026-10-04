@@ -219,8 +219,13 @@ defmodule Improv.Wifi do
 
   # ── VintageNet wrappers (target-only) ──────────────────────────────────────
 
+  # These use apply/3 on purpose: vintage_net is an optional dep, so a literal
+  # remote call would warn "VintageNet.x/n is undefined" when a consumer
+  # compiles improv without it (hence the per-line credo disables).
+
   # Best-effort async refresh of the access_points property; results land later.
   defp default_scan_trigger(ifname) do
+    # credo:disable-for-next-line Credo.Check.Refactor.Apply
     if Code.ensure_loaded?(VintageNet), do: apply(VintageNet, :scan, [ifname]), else: :ok
   rescue
     _ -> :ok
@@ -232,6 +237,7 @@ defmodule Improv.Wifi do
     # ArgumentError "Invalid property element" (HW-found: configure never applied,
     # so provisioning always timed out as unable-to-connect).
     if Code.ensure_loaded?(VintageNet) do
+      # credo:disable-for-next-line Credo.Check.Refactor.Apply
       apply(VintageNet, :configure, [ifname, config])
     else
       {:error, :vintage_net_unavailable}
@@ -239,6 +245,7 @@ defmodule Improv.Wifi do
   end
 
   defp vintage_get(path) do
+    # credo:disable-for-next-line Credo.Check.Refactor.Apply
     if Code.ensure_loaded?(VintageNet), do: apply(VintageNet, :get, [path]), else: nil
   end
 end

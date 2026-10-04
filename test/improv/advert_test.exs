@@ -1,9 +1,9 @@
 defmodule Improv.AdvertTest do
   use ExUnit.Case, async: true
 
+  alias Bluez.Rebus.Message
   alias Improv.Advert
   alias Improv.Protocol
-  alias Bluez.Rebus.Message
 
   @adv_iface "org.bluez.LEAdvertisement1"
   @props_iface "org.freedesktop.DBus.Properties"
@@ -139,7 +139,10 @@ defmodule Improv.AdvertTest do
       %{server: server} = start_advert()
       call_in(server, @adv_iface, "Release", [], "")
 
-      assert_receive {:sent, %Message{type: :method_return}}
+      # Release logs and makes a synchronous adapter-prop call before acking;
+      # under a loaded async suite the logger can push that past the default
+      # 100ms, so allow a wider window (the other dispatch tests don't log).
+      assert_receive {:sent, %Message{type: :method_return}}, 1_000
     end
 
     test "Introspect replies XML" do

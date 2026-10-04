@@ -223,6 +223,52 @@ defmodule ImprovTest do
       assert %{state: :disarmed} = Improv.status(mgr)
     end
 
+    # Timer ticks carry their timer ref ({:timeout, ref, kind}); only the tick
+    # of the timer currently stored in state is acted on. A tick from a timer
+    # that was cancelled/re-armed (already queued or still in flight when
+    # Process.cancel_timer/1 ran) must be dropped.
+    test "a tick for the currently armed idle timer disarms" do
+      %{mgr: mgr} = start_manager(network_type: offline())
+      assert_receive {:gatt, :register}
+
+      %{timer: ref} = :sys.get_state(mgr)
+      assert is_reference(ref)
+      send(mgr, {:timeout, ref, :session_timeout})
+
+      assert_receive {:gatt, :unregister}, 1000
+      assert %{state: :disarmed} = Improv.status(mgr)
+    end
+
+    test "a stale idle-timer tick from before a reset is ignored" do
+      %{mgr: mgr} = start_manager(network_type: offline())
+      assert_receive {:gatt, :register}
+      %{timer: old_ref} = :sys.get_state(mgr)
+
+      # First client activity advances advertising → connected and resets the
+      # idle timer.
+      send(mgr, {:improv_client_activity, :rpc_command})
+      assert %{state: :connected} = Improv.status(mgr)
+      %{timer: new_ref} = :sys.get_state(mgr)
+      assert is_reference(new_ref) and new_ref != old_ref
+
+      # The old timer's tick arrives after the reset.
+      send(mgr, {:timeout, old_ref, :session_timeout})
+      assert %{state: :connected} = Improv.status(mgr)
+      refute_receive {:gatt, :unregister}, 100
+    end
+
+    test "a tick for the currently armed session cap disarms" do
+      %{mgr: mgr} = start_manager(network_type: offline())
+      assert_receive {:gatt, :register}
+
+      %{cap_timer: ref} = :sys.get_state(mgr)
+      assert is_reference(ref)
+      send(mgr, {:timeout, ref, :session_cap})
+
+      assert_receive {:gatt, :unregister}, 1000
+      assert %{state: :disarmed} = Improv.status(mgr)
+    end
+
     test "a later disconnect does NOT re-arm after disarm (once per boot)" do
       %{mgr: mgr} = start_manager(network_type: offline(), timeout_ms: 100)
 
@@ -506,6 +552,41 @@ defmodule ImprovTest do
       assert_receive {:gatt, {:notify, :current_state, <<0x02>>}}, 1000
       assert_receive {:advert, {:set_state, :authorized}}, 1000
       assert %{state: :connected, error: :unable_to_connect} = Improv.status(mgr)
+    end
+
+    test "a tick for the currently armed connect timer fails the provision" do
+      %{mgr: mgr} = start_manager(network_type: offline(), connect_timeout_ms: 10_000)
+      assert_receive {:gatt, :register}
+
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
+      assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
+
+      %{provision_timer: ref} = :sys.get_state(mgr)
+      assert is_reference(ref)
+      send(mgr, {:timeout, ref, :provisioning_failed})
+
+      assert_receive {:gatt, {:notify, :error_state, <<0x03>>}}, 1000
+      assert %{state: :connected, error: :unable_to_connect} = Improv.status(mgr)
+    end
+
+    test "a stale connect-timer tick from before a re-submit is ignored" do
+      %{mgr: mgr} = start_manager(network_type: offline(), connect_timeout_ms: 10_000)
+      assert_receive {:gatt, :register}
+
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password")})
+      assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
+      %{provision_timer: old_ref} = :sys.get_state(mgr)
+
+      # A re-submit while provisioning re-arms the connect timer.
+      send(mgr, {:improv_rpc_command, submit_frame("MyNet", "password2")})
+      assert_receive {:gatt, {:notify, :current_state, <<0x03>>}}
+      %{provision_timer: new_ref} = :sys.get_state(mgr)
+      assert is_reference(new_ref) and new_ref != old_ref
+
+      # The first attempt's tick arrives after the re-arm.
+      send(mgr, {:timeout, old_ref, :provisioning_failed})
+      assert %{state: :provisioning, error: nil} = Improv.status(mgr)
+      refute_receive {:gatt, {:notify, :error_state, _}}, 100
     end
 
     test "a failed provision does NOT reset the idle timer" do
