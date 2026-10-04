@@ -382,7 +382,7 @@ defmodule Improv do
   defp cancel_provision_timer(%{provision_timer: nil} = state), do: state
 
   defp cancel_provision_timer(%{provision_timer: ref} = state) do
-    Process.cancel_timer(ref)
+    cancel_and_flush(ref, :provisioning_failed)
     %{state | provision_timer: nil}
   end
 
@@ -548,8 +548,21 @@ defmodule Improv do
   defp cancel_timer(%{timer: nil} = state), do: state
 
   defp cancel_timer(%{timer: ref} = state) do
-    Process.cancel_timer(ref)
+    cancel_and_flush(ref, :session_timeout)
     %{state | timer: nil}
+  end
+
+  # Process.cancel_timer/1 can't retract a message that already fired, and the
+  # timer messages carry no ref — so drop any delivered-but-unhandled one, or
+  # a stale message would act on the *next* timer (disarm early, etc.).
+  defp cancel_and_flush(ref, msg) do
+    Process.cancel_timer(ref)
+
+    receive do
+      ^msg -> :ok
+    after
+      0 -> :ok
+    end
   end
 
   # Absolute cap, armed once at arm and never reset, so it bounds the whole
@@ -562,7 +575,7 @@ defmodule Improv do
   defp cancel_cap_timer(%{cap_timer: nil} = state), do: state
 
   defp cancel_cap_timer(%{cap_timer: ref} = state) do
-    Process.cancel_timer(ref)
+    cancel_and_flush(ref, :session_cap)
     %{state | cap_timer: nil}
   end
 
@@ -604,6 +617,8 @@ defmodule Improv do
   defp maybe_subscribe_connectivity(_state) do
     if Code.ensure_loaded?(VintageNet) do
       _ = Application.ensure_all_started(:vintage_net)
+      # Deliberate apply/3: vintage_net is optional (see wifi.ex wrappers).
+      # credo:disable-for-next-line Credo.Check.Refactor.Apply
       apply(VintageNet, :subscribe, [@connection_topic])
     end
 

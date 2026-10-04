@@ -223,6 +223,22 @@ defmodule ImprovTest do
       assert %{state: :disarmed} = Improv.status(mgr)
     end
 
+    test "a stale idle-timeout queued behind a timer reset is dropped" do
+      %{mgr: mgr} = start_manager(network_type: offline())
+      assert_receive {:gatt, :register}
+
+      # Race: client activity (which resets the idle timer) is queued, then the
+      # *old* timer fires before the reset runs. Process.cancel_timer/1 can't
+      # retract the delivered :session_timeout, so the reset must flush it.
+      :sys.suspend(mgr)
+      send(mgr, {:improv_client_activity, :rpc_command})
+      send(mgr, :session_timeout)
+      :sys.resume(mgr)
+
+      assert %{state: :connected} = Improv.status(mgr)
+      refute_receive {:gatt, :unregister}, 100
+    end
+
     test "a later disconnect does NOT re-arm after disarm (once per boot)" do
       %{mgr: mgr} = start_manager(network_type: offline(), timeout_ms: 100)
 
