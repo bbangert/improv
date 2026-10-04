@@ -123,7 +123,7 @@ jobs:
           restore-keys: ${{ runner.os }}-sobelow-
       - run: mix deps.get
       # Not a Phoenix app: Sobelow skips the router checks and runs the rest.
-      - run: mix sobelow --skip --exit --threshold medium
+      - run: mix sobelow --private --skip --exit --threshold medium
 
   audit:
     name: Hex audit
