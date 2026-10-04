@@ -266,42 +266,30 @@ defmodule Improv do
     {:noreply, state}
   end
 
-  # Join in flight — the connect timer bounds it; don't cut it on idle timeout.
-  def handle_info(:session_timeout, %{fsm: :provisioning} = state), do: {:noreply, state}
-
-  # Already provisioned — the teardown timer is scheduled; don't double-disarm.
-  def handle_info(:session_timeout, %{fsm: :provisioned} = state), do: {:noreply, state}
-
-  def handle_info(:session_timeout, state) do
-    Logger.info("Improv: session idle timeout — disarming")
-    {:noreply, disarm(state)}
+  # Timers are armed with :erlang.start_timer/3, so each tick carries its
+  # timer ref. Only the tick of the timer currently stored in state counts; a
+  # tick from a timer that was cancelled/re-armed (it can already be queued or
+  # in flight when Process.cancel_timer/1 runs) is stale and dropped.
+  def handle_info({:timeout, ref, :session_timeout}, %{timer: ref} = state) do
+    session_timeout(%{state | timer: nil})
   end
 
-  # Absolute session cap — disarm regardless of activity (defeats indefinite
-  # idle-timer extension via repeated valid submits).
-  def handle_info(:session_cap, %{fsm: :disarmed} = state), do: {:noreply, state}
+  def handle_info({:timeout, ref, :session_cap}, %{cap_timer: ref} = state) do
+    session_cap(%{state | cap_timer: nil})
+  end
 
-  def handle_info(:session_cap, state) do
-    Logger.info("Improv: absolute session cap reached — disarming")
-    {:noreply, disarm(state)}
+  def handle_info({:timeout, ref, :provisioning_failed}, %{provision_timer: ref} = state) do
+    provisioning_failed(%{state | provision_timer: nil})
+  end
+
+  def handle_info({:timeout, _stale_ref, kind}, state)
+      when kind in [:session_timeout, :session_cap, :provisioning_failed] do
+    {:noreply, state}
   end
 
   def handle_info(:provisioned_teardown, state) do
     {:noreply, disarm(state)}
   end
-
-  # wlan0 didn't join in time — bad credentials / out of range. Report the error
-  # and revert to AUTHORIZED so the provisioner can retry within the session.
-  # NO idle-timer reset: a failure is not a meaningful state advance (timeout
-  # reset rule), so the deadline armed at the submit stands.
-  def handle_info(:provisioning_failed, %{fsm: :provisioning} = state) do
-    state = push_error(state, :unable_to_connect)
-
-    {:noreply,
-     state |> Map.put(:provision_timer, nil) |> transition(:connected, reset_timer?: false)}
-  end
-
-  def handle_info(:provisioning_failed, state), do: {:noreply, state}
 
   # The running identify task ended (normally or not) — allow the next 0x02.
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{identify_ref: ref} = state) do
@@ -309,6 +297,39 @@ defmodule Improv do
   end
 
   def handle_info(_other, state), do: {:noreply, state}
+
+  # ── timer expiry (current-ref ticks only, see handle_info/2) ───────────────
+
+  # Join in flight — the connect timer bounds it; don't cut it on idle timeout.
+  defp session_timeout(%{fsm: :provisioning} = state), do: {:noreply, state}
+
+  # Already provisioned — the teardown timer is scheduled; don't double-disarm.
+  defp session_timeout(%{fsm: :provisioned} = state), do: {:noreply, state}
+
+  defp session_timeout(state) do
+    Logger.info("Improv: session idle timeout — disarming")
+    {:noreply, disarm(state)}
+  end
+
+  # Absolute session cap — disarm regardless of activity (defeats indefinite
+  # idle-timer extension via repeated valid submits).
+  defp session_cap(%{fsm: :disarmed} = state), do: {:noreply, state}
+
+  defp session_cap(state) do
+    Logger.info("Improv: absolute session cap reached — disarming")
+    {:noreply, disarm(state)}
+  end
+
+  # wlan0 didn't join in time — bad credentials / out of range. Report the error
+  # and revert to AUTHORIZED so the provisioner can retry within the session.
+  # NO idle-timer reset: a failure is not a meaningful state advance (timeout
+  # reset rule), so the deadline armed at the submit stands.
+  defp provisioning_failed(%{fsm: :provisioning} = state) do
+    state = push_error(state, :unable_to_connect)
+    {:noreply, transition(state, :connected, reset_timer?: false)}
+  end
+
+  defp provisioning_failed(state), do: {:noreply, state}
 
   # ── command dispatch ───────────────────────────────────────────────────────
 
@@ -375,14 +396,14 @@ defmodule Improv do
     %{
       state
       | provision_timer:
-          Process.send_after(self(), :provisioning_failed, state.connect_timeout_ms)
+          :erlang.start_timer(state.connect_timeout_ms, self(), :provisioning_failed)
     }
   end
 
   defp cancel_provision_timer(%{provision_timer: nil} = state), do: state
 
   defp cancel_provision_timer(%{provision_timer: ref} = state) do
-    cancel_and_flush(ref, :provisioning_failed)
+    Process.cancel_timer(ref)
     %{state | provision_timer: nil}
   end
 
@@ -542,40 +563,27 @@ defmodule Improv do
 
   defp reset_timer(state) do
     state = cancel_timer(state)
-    %{state | timer: Process.send_after(self(), :session_timeout, state.timeout_ms)}
+    %{state | timer: :erlang.start_timer(state.timeout_ms, self(), :session_timeout)}
   end
 
   defp cancel_timer(%{timer: nil} = state), do: state
 
   defp cancel_timer(%{timer: ref} = state) do
-    cancel_and_flush(ref, :session_timeout)
-    %{state | timer: nil}
-  end
-
-  # Process.cancel_timer/1 can't retract a message that already fired, and the
-  # timer messages carry no ref — so drop any delivered-but-unhandled one, or
-  # a stale message would act on the *next* timer (disarm early, etc.).
-  defp cancel_and_flush(ref, msg) do
     Process.cancel_timer(ref)
-
-    receive do
-      ^msg -> :ok
-    after
-      0 -> :ok
-    end
+    %{state | timer: nil}
   end
 
   # Absolute cap, armed once at arm and never reset, so it bounds the whole
   # session no matter how often the idle timer is refreshed.
   defp start_cap_timer(state) do
     state = cancel_cap_timer(state)
-    %{state | cap_timer: Process.send_after(self(), :session_cap, state.session_cap_ms)}
+    %{state | cap_timer: :erlang.start_timer(state.session_cap_ms, self(), :session_cap)}
   end
 
   defp cancel_cap_timer(%{cap_timer: nil} = state), do: state
 
   defp cancel_cap_timer(%{cap_timer: ref} = state) do
-    cancel_and_flush(ref, :session_cap)
+    Process.cancel_timer(ref)
     %{state | cap_timer: nil}
   end
 
