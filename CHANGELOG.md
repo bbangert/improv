@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.0
+
+- **Requires Elixir 1.19** and **bluez 0.3**. In bluez 0.3, each D-Bus
+  connection is bound to the process that opened it. `Improv.GattServer`
+  and `Improv.Advert` open their system-bus connection in `init/1`, so a
+  restart of either one now also closes its old connection and socket
+  instead of leaking them.
+- Timer ticks are matched by reference rather than flushed by atom, so a
+  stale tick from a cancelled timer can no longer be taken for the
+  current one.
+
+## v0.1.3
+
+- Requires bluez 0.2; dependency locks refreshed.
+
 ## v0.1.2
 
 - `Improv.Wifi.configure/3` no longer hardcodes `key_mgmt: :wpa_psk` for
