@@ -122,7 +122,7 @@ state/capabilities from the GATT characteristics after connecting.
 ```elixir
 def deps do
   [
-    {:improv, "~> 0.1"}
+    {:improv, "~> 0.2"}
   ]
 end
 ```
