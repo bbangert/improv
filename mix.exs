@@ -37,7 +37,7 @@ defmodule Improv.MixProject do
 
   defp deps do
     [
-      {:bluez, "~> 0.3"},
+      {:bluez, "~> 0.5"},
       {:phoenix_pubsub, "~> 2.1", optional: true},
       # runtime: false so the lib's own dev/test runs never START vintage_net
       # (it writes /etc/resolv.conf at startup — host-hostile). Guarded call
